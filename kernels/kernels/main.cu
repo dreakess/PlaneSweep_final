@@ -27,6 +27,23 @@ typedef double Real;
 typedef float Real;
 #endif
 
+// ====== Configuration Enums ======
+
+enum class MemoryStrategy {
+    CONSTANT_MEMORY,   // Fast, read-only, limited size (~64KB)
+    DEVICE_MEMORY      // Flexible, larger, slightly slower access
+};
+
+enum class DataType {
+    FLOAT32,           // 32-bit float (faster)
+    FLOAT64            // 64-bit double (higher precision)
+};
+
+enum class Algorithm {
+    NAIVE,             // Direct computation, no optimizations
+    SHARED_MEMORY      // Uses shared memory optimization
+};
+
 #define CHK(code) \
 do { \
     if ((code) != cudaSuccess) { \
@@ -36,7 +53,59 @@ do { \
     } \
 } while (0)
 
-// Dynamycally allocated constant memory for camera parameters 
+// ====== Timing and GFLOPS Calculation ======
+
+std::chrono::high_resolution_clock::time_point start_cpu_timer()
+{
+    return std::chrono::high_resolution_clock::now();
+}
+
+void end_cpu_timer(std::chrono::high_resolution_clock::time_point start, const char* name, double flop)
+{
+    auto stop = std::chrono::high_resolution_clock::now();
+    double millisec = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
+    double gflops = flop / (double)millisec / 1e6;
+
+    printf("%s:\n", name);
+    printf("  Processing: %.3f (ms), GFLOPS: %.2f\n", millisec, gflops);
+}
+
+cudaEvent_t start_cuda_timer()
+{
+    cudaEvent_t start;
+    CHK(cudaEventCreate(&start));
+    CHK(cudaEventRecord(start, nullptr));
+    return start;
+}
+
+void end_cuda_timer(cudaEvent_t start, const char* name, double flop)
+{
+    cudaEvent_t stop;
+    CHK(cudaEventCreate(&stop));
+    CHK(cudaEventRecord(stop, nullptr));
+    CHK(cudaEventSynchronize(stop));
+    
+    float millisec;
+    CHK(cudaEventElapsedTime(&millisec, start, stop));
+    double gflops = flop / (double)millisec / 1e6;
+
+    printf("%s:\n", name);
+    printf("  Processing: %.3f (ms), GFLOPS: %.2f\n", millisec, gflops);
+    
+    CHK(cudaEventDestroy(start));
+    CHK(cudaEventDestroy(stop));
+}
+
+// Calculate FLOPS based on SAD algorithm:
+// SAD window size^2 * 2 (subtract + add) * pixels * planes * sensors
+double calculateFLOPs(int img_w, int img_h, int ZPlanes, size_t num_sensors)
+{
+    int kernel_size = 2 * RAD + 1;
+    // 2 ops per SAD comparison + geometry overhead
+    return 2.0 * kernel_size * kernel_size * img_w * img_h * ZPlanes * num_sensors;
+}
+
+// Dynamycally allocated constant memory for camera parameters
 __constant__ Real c_invK[9];
 __constant__ Real c_R_inv[9];
 __constant__ Real c_t_inv[3];
@@ -44,12 +113,13 @@ __constant__ Real c_K_proj[9];
 __constant__ Real c_R_proj[9];
 __constant__ Real c_t_proj[3];
 
-//__device__ Real c_invK[9];
-//__device__ Real c_R_inv[9];
-//__device__ Real c_t_inv[3];
-//__device__ Real c_K_proj[9];
-//__device__ Real c_R_proj[9];
-//__device__ Real c_t_proj[3];
+// Device memory pointers for camera parameters (alternative to constant memory)
+__device__ Real* d_invK = nullptr;
+__device__ Real* d_R_inv = nullptr;
+__device__ Real* d_t_inv = nullptr;
+__device__ Real* d_K_proj = nullptr;
+__device__ Real* d_R_proj = nullptr;
+__device__ Real* d_t_proj = nullptr;
 
 __global__ void warmup(float* A, float* B, int w, int h) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -242,7 +312,6 @@ __global__ void naive_kernel(uint8_t* refY, uint8_t* sensY, float* costCube,
     float cost = 0.0f;
     float count = 0.0f;
 
-    // Il SAD avviene esattamente come prima, leggendo direttamente dalla VRAM (refY e sensY)
     for (int ki = -RAD; ki <= RAD; ++ki) {
         for (int kj = -RAD; kj <= RAD; ++kj) {
             int ref_x = i + ki;
@@ -275,43 +344,39 @@ __global__ void initCostCube(float* cube, int size, float val) {
     if (idx < size) cube[idx] = val;
 }
 
-// Interface for main application to run the plane sweeping algorithm on the GPU
-void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
-    const std::vector<uint8_t*>& sensor_images,
-    const std::vector<std::vector<double>>& cam_params,
-    float* cost_cube, float ZNear, float ZFar, int ZPlanes)
+// ====== Memory Allocation Functions ======
+
+void allocateDeviceMemory(uint8_t*& d_ref, uint8_t*& d_sens, float*& d_costCube,
+    int imgSize, int ZPlanes)
 {
-    const int imgSize = width * height;
-    size_t plane = width * height * sizeof(float);
-
-    //float* warmupA; float* warmupB;
-    //CHK(cudaMalloc(&warmupA, plane));
-    //CHK(cudaMalloc(&warmupB, plane));
-
-    //dim3 warmupblock(BLOCKSIZE, BLOCKSIZE);
-    //dim3 warmupgrid(((width + BLOCKSIZE - 1) / BLOCKSIZE), ((height + BLOCKSIZE - 1) / BLOCKSIZE));
-    //warmup << <warmupgrid, warmupblock >> > (warmupA, warmupB, width, height);
-    //CHK(cudaGetLastError());
-
-    auto total_start = std::chrono::high_resolution_clock::now();
-
-
-    // allocation of device memory for reference image, sensed image, and cost cube
-    uint8_t* d_ref, * d_sens;
-    float* d_costCube;
-
     CHK(cudaMalloc(&d_ref, imgSize));
     CHK(cudaMalloc(&d_sens, imgSize));
     CHK(cudaMalloc(&d_costCube, imgSize * ZPlanes * sizeof(float)));
+}
 
+void deallocateDeviceMemory(uint8_t* d_ref, uint8_t* d_sens, float* d_costCube)
+{
+    CHK(cudaFree(d_ref));
+    CHK(cudaFree(d_sens));
+    CHK(cudaFree(d_costCube));
+}
+
+void initializeConstantMemory(Real* d_costCube, int imgSize, int ZPlanes, float initValue)
+{
     int totalElements = imgSize * ZPlanes;
-    initCostCube << < (totalElements + 255) / 256, 256 >> > (d_costCube, totalElements, 255.0f);
+    initCostCube << < (totalElements + 255) / 256, 256 >> > (d_costCube, totalElements, initValue);
     CHK(cudaDeviceSynchronize());
+}
 
+void copyRefImageToDevice(uint8_t* d_ref, const uint8_t* ref_image, int imgSize)
+{
     CHK(cudaMemcpy(d_ref, ref_image, imgSize, cudaMemcpyHostToDevice));
+}
 
-    // Extraction of camera parameters for the reference camera and copying them to constant memory
-    const auto& ref_params = cam_params[0];
+// ====== Constant Memory Camera Parameters Functions ======
+
+void copyRefCameraParamsToConstantMemory(const std::vector<double>& ref_params)
+{
     std::vector<Real> h_invK(ref_params.begin(), ref_params.begin() + 9);
     std::vector<Real> h_R_inv(ref_params.begin() + 9, ref_params.begin() + 18);
     std::vector<Real> h_t_inv(ref_params.begin() + 18, ref_params.end());
@@ -319,55 +384,272 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
     CHK(cudaMemcpyToSymbol(c_invK, h_invK.data(), 9 * sizeof(Real)));
     CHK(cudaMemcpyToSymbol(c_R_inv, h_R_inv.data(), 9 * sizeof(Real)));
     CHK(cudaMemcpyToSymbol(c_t_inv, h_t_inv.data(), 3 * sizeof(Real)));
+}
 
-    // Definition of block and grid dimensions for the kernel launch
-    dim3 block(BLOCKSIZE, BLOCKSIZE);
-    dim3 grid_3D((width + BLOCKSIZE - 1) / BLOCKSIZE, (height + BLOCKSIZE - 1) / BLOCKSIZE, ZPlanes);
+void copySensorCameraParamsToConstantMemory(const std::vector<double>& sens_params)
+{
+    std::vector<Real> h_K_proj(sens_params.begin(), sens_params.begin() + 9);
+    std::vector<Real> h_R_proj(sens_params.begin() + 9, sens_params.begin() + 18);
+    std::vector<Real> h_t_proj(sens_params.begin() + 18, sens_params.end());
 
-    // definition of shared memory size for the shared kernel (if used)
-    size_t sharedMemBytes = (BLOCKSIZE + 2 * RAD) * (BLOCKSIZE + 2 * RAD) * sizeof(uint8_t);
+    CHK(cudaMemcpyToSymbol(c_K_proj, h_K_proj.data(), 9 * sizeof(Real)));
+    CHK(cudaMemcpyToSymbol(c_R_proj, h_R_proj.data(), 9 * sizeof(Real)));
+    CHK(cudaMemcpyToSymbol(c_t_proj, h_t_proj.data(), 3 * sizeof(Real)));
+}
 
-    auto kernel_start = std::chrono::high_resolution_clock::now();
+void copySensorImageToDevice(uint8_t* d_sens, const uint8_t* sensor_image, int imgSize)
+{
+    CHK(cudaMemcpy(d_sens, sensor_image, imgSize, cudaMemcpyHostToDevice));
+}
 
+// ====== Device Memory Camera Parameters Functions ======
 
-    // loop over the sensed images (projector views)
+void allocateCameraParamsDeviceMemory(Real*& d_invK, Real*& d_R_inv, Real*& d_t_inv,
+                                       Real*& d_K_proj, Real*& d_R_proj, Real*& d_t_proj)
+{
+    CHK(cudaMalloc(&d_invK, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&d_R_inv, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&d_t_inv, 3 * sizeof(Real)));
+    CHK(cudaMalloc(&d_K_proj, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&d_R_proj, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&d_t_proj, 3 * sizeof(Real)));
+}
+
+void deallocateCameraParamsDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
+                                        Real* d_K_proj, Real* d_R_proj, Real* d_t_proj)
+{
+    CHK(cudaFree(d_invK));
+    CHK(cudaFree(d_R_inv));
+    CHK(cudaFree(d_t_inv));
+    CHK(cudaFree(d_K_proj));
+    CHK(cudaFree(d_R_proj));
+    CHK(cudaFree(d_t_proj));
+}
+
+void copyRefCameraParamsToDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
+                                        const std::vector<double>& ref_params)
+{
+    std::vector<Real> h_invK(ref_params.begin(), ref_params.begin() + 9);
+    std::vector<Real> h_R_inv(ref_params.begin() + 9, ref_params.begin() + 18);
+    std::vector<Real> h_t_inv(ref_params.begin() + 18, ref_params.end());
+
+    CHK(cudaMemcpy(d_invK, h_invK.data(), 9 * sizeof(Real), cudaMemcpyHostToDevice));
+    CHK(cudaMemcpy(d_R_inv, h_R_inv.data(), 9 * sizeof(Real), cudaMemcpyHostToDevice));
+    CHK(cudaMemcpy(d_t_inv, h_t_inv.data(), 3 * sizeof(Real), cudaMemcpyHostToDevice));
+}
+
+void copySensorCameraParamsToDeviceMemory(Real* d_K_proj, Real* d_R_proj, Real* d_t_proj,
+                                          const std::vector<double>& sens_params)
+{
+    std::vector<Real> h_K_proj(sens_params.begin(), sens_params.begin() + 9);
+    std::vector<Real> h_R_proj(sens_params.begin() + 9, sens_params.begin() + 18);
+    std::vector<Real> h_t_proj(sens_params.begin() + 18, sens_params.end());
+
+    CHK(cudaMemcpy(d_K_proj, h_K_proj.data(), 9 * sizeof(Real), cudaMemcpyHostToDevice));
+    CHK(cudaMemcpy(d_R_proj, h_R_proj.data(), 9 * sizeof(Real), cudaMemcpyHostToDevice));
+    CHK(cudaMemcpy(d_t_proj, h_t_proj.data(), 3 * sizeof(Real), cudaMemcpyHostToDevice));
+}
+
+// ====== Kernel Launch Configuration ======
+
+dim3 getBlockDimensions()
+{
+    return dim3(BLOCKSIZE, BLOCKSIZE);
+}
+
+dim3 getGridDimensions(int width, int height, int ZPlanes)
+{
+    return dim3((width + BLOCKSIZE - 1) / BLOCKSIZE, (height + BLOCKSIZE - 1) / BLOCKSIZE, ZPlanes);
+}
+
+size_t getSharedMemorySize()
+{
+    return (BLOCKSIZE + 2 * RAD) * (BLOCKSIZE + 2 * RAD) * sizeof(uint8_t);
+}
+
+void launchProcessingKernel(uint8_t* d_ref, uint8_t* d_sens, float* d_costCube,
+    int width, int height, float ZNear, float ZFar, int ZPlanes,
+    const dim3& block, const dim3& grid, size_t sharedMemBytes)
+{
+    naive_kernel << <grid, block, sharedMemBytes >> > (
+        d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
+    CHK(cudaGetLastError());
+}
+
+void copyResultToHost(float* cost_cube, const float* d_costCube, int imgSize, int ZPlanes)
+{
+    CHK(cudaMemcpy(cost_cube, d_costCube, imgSize * ZPlanes * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
+// ====== Super Wrapper Function with all options ======
+
+void runPlaneSweepingGPU_Advanced(const uint8_t* ref_image, int width, int height,
+    const std::vector<uint8_t*>& sensor_images,
+    const std::vector<std::vector<double>>& cam_params,
+    float* cost_cube, float ZNear, float ZFar, int ZPlanes,
+    MemoryStrategy memory_strategy = MemoryStrategy::CONSTANT_MEMORY,
+    DataType data_type = DataType::FLOAT32,
+    Algorithm algorithm = Algorithm::NAIVE)
+{
+    // Validate data type matches compile-time setting
+    bool using_double = (data_type == DataType::FLOAT64);
+#if USE_DOUBLE
+    if (!using_double) {
+        printf("Warning: Compiled with FLOAT64, but FLOAT32 requested. Using FLOAT64.\n");
+    }
+#else
+    if (using_double) {
+        printf("Warning: Compiled with FLOAT32, but FLOAT64 requested. Using FLOAT32.\n");
+    }
+#endif
+
+    printf("===== PlaneSweeping GPU Configuration =====\n");
+    printf("Memory Strategy: %s\n", 
+        memory_strategy == MemoryStrategy::CONSTANT_MEMORY ? "CONSTANT_MEMORY" : "DEVICE_MEMORY");
+    printf("Data Type: %s\n",
+        data_type == DataType::FLOAT32 ? "FLOAT32" : "FLOAT64");
+    printf("Algorithm: %s\n",
+        algorithm == Algorithm::NAIVE ? "NAIVE" : "SHARED_MEMORY");
+    printf("==========================================\n\n");
+
+    if (memory_strategy == MemoryStrategy::CONSTANT_MEMORY) {
+        runPlaneSweepingGPU_ConstantMemory(ref_image, width, height, sensor_images, cam_params,
+                                           cost_cube, ZNear, ZFar, ZPlanes);
+    } else {
+        runPlaneSweepingGPU_DeviceMemory(ref_image, width, height, sensor_images, cam_params,
+                                         cost_cube, ZNear, ZFar, ZPlanes);
+    }
+}
+
+// ====== Wrapper function with memory strategy selection ======
+
+void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
+    const std::vector<uint8_t*>& sensor_images,
+    const std::vector<std::vector<double>>& cam_params,
+    float* cost_cube, float ZNear, float ZFar, int ZPlanes,
+    MemoryStrategy strategy = MemoryStrategy::CONSTANT_MEMORY)
+{
+    runPlaneSweepingGPU_Advanced(ref_image, width, height, sensor_images, cam_params,
+                                 cost_cube, ZNear, ZFar, ZPlanes,
+                                 strategy, DataType::FLOAT32, Algorithm::NAIVE);
+}
+
+// ====== Implementation using Constant Memory (Fast) ======
+
+void runPlaneSweepingGPU_ConstantMemory(const uint8_t* ref_image, int width, int height,
+    const std::vector<uint8_t*>& sensor_images,
+    const std::vector<std::vector<double>>& cam_params,
+    float* cost_cube, float ZNear, float ZFar, int ZPlanes)
+{
+    auto total_start = start_cpu_timer();
+    double flops = calculateFLOPs(width, height, ZPlanes, sensor_images.size());
+
+    const int imgSize = width * height;
+
+    // Allocate device memory
+    uint8_t* d_ref, * d_sens;
+    float* d_costCube;
+    allocateDeviceMemory(d_ref, d_sens, d_costCube, imgSize, ZPlanes);
+
+    // Initialize cost cube with maximum value
+    initializeConstantMemory(d_costCube, imgSize, ZPlanes, 255.0f);
+
+    // Copy reference image to device
+    copyRefImageToDevice(d_ref, ref_image, imgSize);
+
+    // Setup reference camera parameters to constant memory
+    copyRefCameraParamsToConstantMemory(cam_params[0]);
+
+    // Setup kernel grid and block dimensions
+    dim3 block = getBlockDimensions();
+    dim3 grid_3D = getGridDimensions(width, height, ZPlanes);
+    size_t sharedMemBytes = getSharedMemorySize();
+
+    auto kernel_start = start_cuda_timer();
+
+    // Process each sensor image
     for (size_t c = 0; c < sensor_images.size(); c++) {
-        const auto& sens_params = cam_params[c + 1];
+        // Update sensor camera parameters in constant memory
+        copySensorCameraParamsToConstantMemory(cam_params[c + 1]);
 
-        std::vector<Real> h_K_proj(sens_params.begin(), sens_params.begin() + 9);
-        std::vector<Real> h_R_proj(sens_params.begin() + 9, sens_params.begin() + 18);
-        std::vector<Real> h_t_proj(sens_params.begin() + 18, sens_params.end());
+        // Copy sensor image to device
+        copySensorImageToDevice(d_sens, sensor_images[c], imgSize);
 
-        CHK(cudaMemcpyToSymbol(c_K_proj, h_K_proj.data(), 9 * sizeof(Real)));
-        CHK(cudaMemcpyToSymbol(c_R_proj, h_R_proj.data(), 9 * sizeof(Real)));
-        CHK(cudaMemcpyToSymbol(c_t_proj, h_t_proj.data(), 3 * sizeof(Real)));
-
-        CHK(cudaMemcpy(d_sens, sensor_images[c], imgSize, cudaMemcpyHostToDevice));
-
-        // launch of the kernel for this sensed image (projector view) - shared memory version
-        naive_kernel << <grid_3D, block, sharedMemBytes >> > (
-            d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
-
-        //shared_kernel << <grid_3D, block, sharedMemBytes >> > (
-        //    d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
-
-        CHK(cudaGetLastError());
+        // Launch kernel
+        launchProcessingKernel(d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes,
+            block, grid_3D, sharedMemBytes);
     }
 
-    auto kernel_end = std::chrono::high_resolution_clock::now();
-    auto total_end = std::chrono::high_resolution_clock::now();
-
-    double kernel_ms = std::chrono::duration<double>(kernel_end - kernel_start).count();
-
-    double total_ms = std::chrono::duration<double>(total_end - total_start).count();
-
-    printf("Kernel time: %.3f s\n", kernel_ms);
-    printf("Total time: %.3f s \n", total_ms);
-
+    // Synchronize and retrieve results
     CHK(cudaDeviceSynchronize());
+    end_cuda_timer(kernel_start, "CONSTANT_MEMORY (Kernel)", flops);
 
-    CHK(cudaMemcpy(cost_cube, d_costCube, imgSize * ZPlanes * sizeof(float), cudaMemcpyDeviceToHost));
+    copyResultToHost(cost_cube, d_costCube, imgSize, ZPlanes);
+    end_cpu_timer(total_start, "CONSTANT_MEMORY (Total)", flops);
 
-    CHK(cudaFree(d_ref)); CHK(cudaFree(d_sens)); CHK(cudaFree(d_costCube));
-    //CHK(cudaFree(warmupA)); CHK(cudaFree(warmupB));
+    // Cleanup
+    deallocateDeviceMemory(d_ref, d_sens, d_costCube);
+}
+
+// ====== Implementation using Device Memory (Flexible) ======
+
+void runPlaneSweepingGPU_DeviceMemory(const uint8_t* ref_image, int width, int height,
+    const std::vector<uint8_t*>& sensor_images,
+    const std::vector<std::vector<double>>& cam_params,
+    float* cost_cube, float ZNear, float ZFar, int ZPlanes)
+{
+    auto total_start = start_cpu_timer();
+    double flops = calculateFLOPs(width, height, ZPlanes, sensor_images.size());
+
+    const int imgSize = width * height;
+
+    // Allocate device memory for images
+    uint8_t* d_ref, * d_sens;
+    float* d_costCube;
+    allocateDeviceMemory(d_ref, d_sens, d_costCube, imgSize, ZPlanes);
+
+    // Initialize cost cube with maximum value
+    initializeConstantMemory(d_costCube, imgSize, ZPlanes, 255.0f);
+
+    // Copy reference image to device
+    copyRefImageToDevice(d_ref, ref_image, imgSize);
+
+    // Allocate device memory for camera parameters
+    Real* d_invK, * d_R_inv, * d_t_inv;
+    Real* d_K_proj, * d_R_proj, * d_t_proj;
+    allocateCameraParamsDeviceMemory(d_invK, d_R_inv, d_t_inv, d_K_proj, d_R_proj, d_t_proj);
+
+    // Setup reference camera parameters to device memory
+    copyRefCameraParamsToDeviceMemory(d_invK, d_R_inv, d_t_inv, cam_params[0]);
+
+    // Setup kernel grid and block dimensions
+    dim3 block = getBlockDimensions();
+    dim3 grid_3D = getGridDimensions(width, height, ZPlanes);
+    size_t sharedMemBytes = getSharedMemorySize();
+
+    auto kernel_start = start_cuda_timer();
+
+    // Process each sensor image
+    for (size_t c = 0; c < sensor_images.size(); c++) {
+        // Update sensor camera parameters in device memory
+        copySensorCameraParamsToDeviceMemory(d_K_proj, d_R_proj, d_t_proj, cam_params[c + 1]);
+
+        // Copy sensor image to device
+        copySensorImageToDevice(d_sens, sensor_images[c], imgSize);
+
+        // Launch kernel
+        launchProcessingKernel(d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes,
+            block, grid_3D, sharedMemBytes);
+    }
+
+    // Synchronize and retrieve results
+    CHK(cudaDeviceSynchronize());
+    end_cuda_timer(kernel_start, "DEVICE_MEMORY (Kernel)", flops);
+
+    copyResultToHost(cost_cube, d_costCube, imgSize, ZPlanes);
+    end_cpu_timer(total_start, "DEVICE_MEMORY (Total)", flops);
+
+    // Cleanup
+    deallocateDeviceMemory(d_ref, d_sens, d_costCube);
+    deallocateCameraParamsDeviceMemory(d_invK, d_R_inv, d_t_inv, d_K_proj, d_R_proj, d_t_proj);
 }
