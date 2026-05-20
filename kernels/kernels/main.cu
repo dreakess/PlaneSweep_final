@@ -44,6 +44,21 @@ enum class Algorithm {
     SHARED_MEMORY      // Uses shared memory optimization
 };
 
+// ====== Forward Declarations ======
+
+void allocateDeviceMemory(uint8_t*& d_ref, uint8_t*& d_sens, float*& d_costCube,
+    int imgSize, int ZPlanes);
+void deallocateDeviceMemory(uint8_t* d_ref, uint8_t* d_sens, float* d_costCube);
+
+void allocateCameraParamsDeviceMemory(Real*& d_invK, Real*& d_R_inv, Real*& d_t_inv,
+                                       Real*& d_K_proj, Real*& d_R_proj, Real*& d_t_proj);
+void deallocateCameraParamsDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
+                                        Real* d_K_proj, Real* d_R_proj, Real* d_t_proj);
+void copyRefCameraParamsToDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
+                                        const std::vector<double>& ref_params);
+void copySensorCameraParamsToDeviceMemory(Real* d_K_proj, Real* d_R_proj, Real* d_t_proj,
+                                          const std::vector<double>& sens_params);
+
 #define CHK(code) \
 do { \
     if ((code) != cudaSuccess) { \
@@ -469,10 +484,16 @@ size_t getSharedMemorySize()
 
 void launchProcessingKernel(uint8_t* d_ref, uint8_t* d_sens, float* d_costCube,
     int width, int height, float ZNear, float ZFar, int ZPlanes,
-    const dim3& block, const dim3& grid, size_t sharedMemBytes)
+    const dim3& block, const dim3& grid, size_t sharedMemBytes,
+    Algorithm algo = Algorithm::NAIVE)
 {
-    naive_kernel << <grid, block, sharedMemBytes >> > (
-        d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
+    if (algo == Algorithm::NAIVE) {
+        naive_kernel << <grid, block, sharedMemBytes >> > (
+            d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
+    } else {
+        shared_kernel << <grid, block, sharedMemBytes >> > (
+            d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
+    }
     CHK(cudaGetLastError());
 }
 
@@ -539,7 +560,8 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
 void runPlaneSweepingGPU_ConstantMemory(const uint8_t* ref_image, int width, int height,
     const std::vector<uint8_t*>& sensor_images,
     const std::vector<std::vector<double>>& cam_params,
-    float* cost_cube, float ZNear, float ZFar, int ZPlanes)
+    float* cost_cube, float ZNear, float ZFar, int ZPlanes,
+    Algorithm algo = Algorithm::NAIVE)
 {
     auto total_start = start_cpu_timer();
     double flops = calculateFLOPs(width, height, ZPlanes, sensor_images.size());
@@ -575,9 +597,9 @@ void runPlaneSweepingGPU_ConstantMemory(const uint8_t* ref_image, int width, int
         // Copy sensor image to device
         copySensorImageToDevice(d_sens, sensor_images[c], imgSize);
 
-        // Launch kernel
+        // Launch kernel with algorithm selection
         launchProcessingKernel(d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes,
-            block, grid_3D, sharedMemBytes);
+            block, grid_3D, sharedMemBytes, algo);
     }
 
     // Synchronize and retrieve results
