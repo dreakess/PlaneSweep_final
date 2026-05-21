@@ -55,6 +55,8 @@ do { \
 
 // ====== Timing and GFLOPS Calculation ======
 
+// ====== Timing and GFLOPS Calculation (MODIFIED FOR SECONDS) ======
+
 std::chrono::high_resolution_clock::time_point start_cpu_timer()
 {
     return std::chrono::high_resolution_clock::now();
@@ -63,11 +65,11 @@ std::chrono::high_resolution_clock::time_point start_cpu_timer()
 void end_cpu_timer(std::chrono::high_resolution_clock::time_point start, const char* name, double flop)
 {
     auto stop = std::chrono::high_resolution_clock::now();
-    double millisec = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
-    double gflops = flop / (double)millisec / 1e6;
+    double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(stop - start).count();
+    double gflops = flop / seconds / 1e9;
 
     printf("%s:\n", name);
-    printf("  Processing: %.3f (ms), GFLOPS: %.2f\n", millisec, gflops);
+    printf("  Processing: %.6f (s), GFLOPS: %.2f\n", seconds, gflops);
 }
 
 cudaEvent_t start_cuda_timer()
@@ -87,10 +89,11 @@ void end_cuda_timer(cudaEvent_t start, const char* name, double flop)
     
     float millisec;
     CHK(cudaEventElapsedTime(&millisec, start, stop));
-    double gflops = flop / (double)millisec / 1e6;
+    double seconds = millisec / 1000.0;  // Converti millisecondi a secondi
+    double gflops = flop / seconds / 1e9;
 
     printf("%s:\n", name);
-    printf("  Processing: %.3f (ms), GFLOPS: %.2f\n", millisec, gflops);
+    printf("  Processing: %.6f (s), GFLOPS: %.2f\n", seconds, gflops);
     
     CHK(cudaEventDestroy(start));
     CHK(cudaEventDestroy(stop));
