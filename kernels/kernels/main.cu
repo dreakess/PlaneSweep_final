@@ -129,12 +129,12 @@ __constant__ Real c_R_proj[9];
 __constant__ Real c_t_proj[3];
 
 // Device memory pointers for camera parameters (alternative to constant memory)
-__device__ Real* d_invK = nullptr;
-__device__ Real* d_R_inv = nullptr;
-__device__ Real* d_t_inv = nullptr;
-__device__ Real* d_K_proj = nullptr;
-__device__ Real* d_R_proj = nullptr;
-__device__ Real* d_t_proj = nullptr;
+__device__ Real d_invK[9];
+__device__ Real d_R_inv[9];
+__device__ Real d_t_inv[3];
+__device__ Real d_K_proj[9];
+__device__ Real d_R_proj[9];
+__device__ Real d_t_proj[3];
 
 __global__ void warmup(float* A, float* B, int w, int h) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -419,26 +419,31 @@ void copySensorImageToDevice(uint8_t* d_sens, const uint8_t* sensor_image, int i
 
 // ====== Device Memory Camera Parameters Functions ======
 
-void allocateCameraParamsDeviceMemory(Real*& h_ptr_invK, Real*& h_ptr_R_inv, Real*& h_ptr_t_inv,
-                                       Real*& h_ptr_K_proj, Real*& h_ptr_R_proj, Real*& h_ptr_t_proj)
-{
-    // 1. Alloca la memoria (h_ptr_... contengono ora gli indirizzi VRAM validi)
-    CHK(cudaMalloc(&h_ptr_invK, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&h_ptr_R_inv, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&h_ptr_t_inv, 3 * sizeof(Real)));
-    CHK(cudaMalloc(&h_ptr_K_proj, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&h_ptr_R_proj, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&h_ptr_t_proj, 3 * sizeof(Real)));
 
-    // 2. IL PONTE: Copia questi indirizzi dentro i puntatori globali __device__ della GPU
-    // Nota: d_invK è il nome della variabile __device__ in cima al tuo file
-    CHK(cudaMemcpyToSymbol(d_invK, &h_ptr_invK, sizeof(Real*)));
-    CHK(cudaMemcpyToSymbol(d_R_inv, &h_ptr_R_inv, sizeof(Real*)));
-    CHK(cudaMemcpyToSymbol(d_t_inv, &h_ptr_t_inv, sizeof(Real*)));
-    CHK(cudaMemcpyToSymbol(d_K_proj, &h_ptr_K_proj, sizeof(Real*)));
-    CHK(cudaMemcpyToSymbol(d_R_proj, &h_ptr_R_proj, sizeof(Real*)));
-    CHK(cudaMemcpyToSymbol(d_t_proj, &h_ptr_t_proj, sizeof(Real*)));
+void copyRefCameraParamsToDeviceMemory(const std::vector<double>& ref_params)
+{
+    std::vector<Real> h_invK(ref_params.begin(), ref_params.begin() + 9);
+    std::vector<Real> h_R_inv(ref_params.begin() + 9, ref_params.begin() + 18);
+    std::vector<Real> h_t_inv(ref_params.begin() + 18, ref_params.end());
+
+    // Usiamo MemcpyToSymbol direttamente verso gli array della memoria globale!
+    CHK(cudaMemcpyToSymbol(d_invK, h_invK.data(), 9 * sizeof(Real)));
+    CHK(cudaMemcpyToSymbol(d_R_inv, h_R_inv.data(), 9 * sizeof(Real)));
+    CHK(cudaMemcpyToSymbol(d_t_inv, h_t_inv.data(), 3 * sizeof(Real)));
 }
+
+void copySensorCameraParamsToDeviceMemory(const std::vector<double>& sens_params)
+{
+    std::vector<Real> h_K_proj(sens_params.begin(), sens_params.begin() + 9);
+    std::vector<Real> h_R_proj(sens_params.begin() + 9, sens_params.begin() + 18);
+    std::vector<Real> h_t_proj(sens_params.begin() + 18, sens_params.end());
+
+    // Idem per il sensore
+    CHK(cudaMemcpyToSymbol(d_K_proj, h_K_proj.data(), 9 * sizeof(Real)));
+    CHK(cudaMemcpyToSymbol(d_R_proj, h_R_proj.data(), 9 * sizeof(Real)));
+    CHK(cudaMemcpyToSymbol(d_t_proj, h_t_proj.data(), 3 * sizeof(Real)));
+}
+
 
 void deallocateCameraParamsDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
                                         Real* d_K_proj, Real* d_R_proj, Real* d_t_proj)
