@@ -51,13 +51,13 @@ void allocateDeviceMemory(uint8_t*& d_ref, uint8_t*& d_sens, float*& d_costCube,
 void deallocateDeviceMemory(uint8_t* d_ref, uint8_t* d_sens, float* d_costCube);
 
 void allocateCameraParamsDeviceMemory(Real*& d_invK, Real*& d_R_inv, Real*& d_t_inv,
-                                       Real*& d_K_proj, Real*& d_R_proj, Real*& d_t_proj);
+    Real*& d_K_proj, Real*& d_R_proj, Real*& d_t_proj);
 void deallocateCameraParamsDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
-                                        Real* d_K_proj, Real* d_R_proj, Real* d_t_proj);
+    Real* d_K_proj, Real* d_R_proj, Real* d_t_proj);
 void copyRefCameraParamsToDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
-                                        const std::vector<double>& ref_params);
+    const std::vector<double>& ref_params);
 void copySensorCameraParamsToDeviceMemory(Real* d_K_proj, Real* d_R_proj, Real* d_t_proj,
-                                          const std::vector<double>& sens_params);
+    const std::vector<double>& sens_params);
 
 #define CHK(code) \
 do { \
@@ -99,14 +99,14 @@ void end_cuda_timer(cudaEvent_t start, const char* name, double flop)
     CHK(cudaEventCreate(&stop));
     CHK(cudaEventRecord(stop, nullptr));
     CHK(cudaEventSynchronize(stop));
-    
+
     float millisec;
     CHK(cudaEventElapsedTime(&millisec, start, stop));
     double gflops = flop / (double)millisec / 1e6;
 
     printf("%s:\n", name);
     printf("  Processing: %.3f (ms), GFLOPS: %.2f\n", millisec, gflops);
-    
+
     CHK(cudaEventDestroy(start));
     CHK(cudaEventDestroy(stop));
 }
@@ -419,7 +419,6 @@ void copySensorImageToDevice(uint8_t* d_sens, const uint8_t* sensor_image, int i
 
 // ====== Device Memory Camera Parameters Functions ======
 
-
 void copyRefCameraParamsToDeviceMemory(const std::vector<double>& ref_params)
 {
     std::vector<Real> h_invK(ref_params.begin(), ref_params.begin() + 9);
@@ -444,9 +443,8 @@ void copySensorCameraParamsToDeviceMemory(const std::vector<double>& sens_params
     CHK(cudaMemcpyToSymbol(d_t_proj, h_t_proj.data(), 3 * sizeof(Real)));
 }
 
-
 void deallocateCameraParamsDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
-                                        Real* d_K_proj, Real* d_R_proj, Real* d_t_proj)
+    Real* d_K_proj, Real* d_R_proj, Real* d_t_proj)
 {
     CHK(cudaFree(d_invK));
     CHK(cudaFree(d_R_inv));
@@ -457,7 +455,7 @@ void deallocateCameraParamsDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_i
 }
 
 void copyRefCameraParamsToDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
-                                        const std::vector<double>& ref_params)
+    const std::vector<double>& ref_params)
 {
     std::vector<Real> h_invK(ref_params.begin(), ref_params.begin() + 9);
     std::vector<Real> h_R_inv(ref_params.begin() + 9, ref_params.begin() + 18);
@@ -469,7 +467,7 @@ void copyRefCameraParamsToDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_in
 }
 
 void copySensorCameraParamsToDeviceMemory(Real* d_K_proj, Real* d_R_proj, Real* d_t_proj,
-                                          const std::vector<double>& sens_params)
+    const std::vector<double>& sens_params)
 {
     std::vector<Real> h_K_proj(sens_params.begin(), sens_params.begin() + 9);
     std::vector<Real> h_R_proj(sens_params.begin() + 9, sens_params.begin() + 18);
@@ -505,7 +503,8 @@ void launchProcessingKernel(uint8_t* d_ref, uint8_t* d_sens, float* d_costCube,
     if (algo == Algorithm::NAIVE) {
         naive_kernel << <grid, block, sharedMemBytes >> > (
             d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
-    } else {
+    }
+    else {
         shared_kernel << <grid, block, sharedMemBytes >> > (
             d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
     }
@@ -519,56 +518,9 @@ void copyResultToHost(float* cost_cube, const float* d_costCube, int imgSize, in
 
 // ====== Super Wrapper Function with all options ======
 
-void runPlaneSweepingGPU_Advanced(const uint8_t* ref_image, int width, int height,
-    const std::vector<uint8_t*>& sensor_images,
-    const std::vector<std::vector<double>>& cam_params,
-    float* cost_cube, float ZNear, float ZFar, int ZPlanes,
-    MemoryStrategy memory_strategy = MemoryStrategy::CONSTANT_MEMORY,
-    DataType data_type = DataType::FLOAT32,
-    Algorithm algorithm = Algorithm::NAIVE)
-{
-    // Validate data type matches compile-time setting
-    bool using_double = (data_type == DataType::FLOAT64);
-#if USE_DOUBLE
-    if (!using_double) {
-        printf("Warning: Compiled with FLOAT64, but FLOAT32 requested. Using FLOAT64.\n");
-    }
-#else
-    if (using_double) {
-        printf("Warning: Compiled with FLOAT32, but FLOAT64 requested. Using FLOAT32.\n");
-    }
-#endif
 
-    printf("===== PlaneSweeping GPU Configuration =====\n");
-    printf("Memory Strategy: %s\n", 
-        memory_strategy == MemoryStrategy::CONSTANT_MEMORY ? "CONSTANT_MEMORY" : "DEVICE_MEMORY");
-    printf("Data Type: %s\n",
-        data_type == DataType::FLOAT32 ? "FLOAT32" : "FLOAT64");
-    printf("Algorithm: %s\n",
-        algorithm == Algorithm::NAIVE ? "NAIVE" : "SHARED_MEMORY");
-    printf("==========================================\n\n");
 
-    if (memory_strategy == MemoryStrategy::CONSTANT_MEMORY) {
-        runPlaneSweepingGPU_ConstantMemory(ref_image, width, height, sensor_images, cam_params,
-                                           cost_cube, ZNear, ZFar, ZPlanes);
-    } else {
-        runPlaneSweepingGPU_DeviceMemory(ref_image, width, height, sensor_images, cam_params,
-                                         cost_cube, ZNear, ZFar, ZPlanes);
-    }
-}
 
-// ====== Wrapper function with memory strategy selection ======
-
-void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
-    const std::vector<uint8_t*>& sensor_images,
-    const std::vector<std::vector<double>>& cam_params,
-    float* cost_cube, float ZNear, float ZFar, int ZPlanes,
-    MemoryStrategy strategy = MemoryStrategy::CONSTANT_MEMORY)
-{
-    runPlaneSweepingGPU_Advanced(ref_image, width, height, sensor_images, cam_params,
-                                 cost_cube, ZNear, ZFar, ZPlanes,
-                                 strategy, DataType::FLOAT32, Algorithm::NAIVE);
-}
 
 // ====== Implementation using Constant Memory (Fast) ======
 
@@ -633,7 +585,7 @@ void runPlaneSweepingGPU_ConstantMemory(const uint8_t* ref_image, int width, int
 void runPlaneSweepingGPU_DeviceMemory(const uint8_t* ref_image, int width, int height,
     const std::vector<uint8_t*>& sensor_images,
     const std::vector<std::vector<double>>& cam_params,
-    float* cost_cube, float ZNear, float ZFar, int ZPlanes)
+    float* cost_cube, float ZNear, float ZFar, int ZPlanes, Algorithm algo = Algorithm::NAIVE)
 {
     auto total_start = start_cpu_timer();
     double flops = calculateFLOPs(width, height, ZPlanes, sensor_images.size());
@@ -676,7 +628,7 @@ void runPlaneSweepingGPU_DeviceMemory(const uint8_t* ref_image, int width, int h
 
         // Launch kernel
         launchProcessingKernel(d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes,
-            block, grid_3D, sharedMemBytes);
+            block, grid_3D, sharedMemBytes,algo);
     }
 
     // Synchronize and retrieve results
@@ -689,4 +641,43 @@ void runPlaneSweepingGPU_DeviceMemory(const uint8_t* ref_image, int width, int h
     // Cleanup
     deallocateDeviceMemory(d_ref, d_sens, d_costCube);
     deallocateCameraParamsDeviceMemory(d_invK, d_R_inv, d_t_inv, d_K_proj, d_R_proj, d_t_proj);
+}
+
+void runPlaneSweepingGPU_Advanced(const uint8_t* ref_image, int width, int height,
+    const std::vector<uint8_t*>& sensor_images,
+    const std::vector<std::vector<double>>& cam_params,
+    float* cost_cube, float ZNear, float ZFar, int ZPlanes,
+    MemoryStrategy memory_strategy = MemoryStrategy::CONSTANT_MEMORY,
+    DataType data_type = DataType::FLOAT32,
+    Algorithm algorithm = Algorithm::NAIVE)
+{
+    // Validate data type matches compile-time setting
+    bool using_double = (data_type == DataType::FLOAT64);
+#if USE_DOUBLE
+    if (!using_double) {
+        printf("Warning: Compiled with FLOAT64, but FLOAT32 requested. Using FLOAT64.\n");
+    }
+#else
+    if (using_double) {
+        printf("Warning: Compiled with FLOAT32, but FLOAT64 requested. Using FLOAT32.\n");
+    }
+#endif
+
+    printf("===== PlaneSweeping GPU Configuration =====\n");
+    printf("Memory Strategy: %s\n",
+        memory_strategy == MemoryStrategy::CONSTANT_MEMORY ? "CONSTANT_MEMORY" : "DEVICE_MEMORY");
+    printf("Data Type: %s\n",
+        data_type == DataType::FLOAT32 ? "FLOAT32" : "FLOAT64");
+    printf("Algorithm: %s\n",
+        algorithm == Algorithm::NAIVE ? "NAIVE" : "SHARED_MEMORY");
+    printf("==========================================\n\n");
+
+    if (memory_strategy == MemoryStrategy::CONSTANT_MEMORY) {
+        runPlaneSweepingGPU_ConstantMemory(ref_image, width, height, sensor_images, cam_params,
+            cost_cube, ZNear, ZFar, ZPlanes, algorithm);
+    }
+    else {
+        runPlaneSweepingGPU_DeviceMemory(ref_image, width, height, sensor_images, cam_params,
+            cost_cube, ZNear, ZFar, ZPlanes, algorithm);
+    }
 }
