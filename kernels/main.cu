@@ -50,6 +50,58 @@ __constant__ Real c_t_proj[3];
 //__device__ Real c_R_proj[9];
 //__device__ Real c_t_proj[3];
 
+
+std::chrono::high_resolution_clock::time_point start_cpu_timer()
+{
+    return std::chrono::high_resolution_clock::now();
+}
+
+void end_cpu_timer(std::chrono::high_resolution_clock::time_point start, const char* name, double flop)
+{
+    auto stop = std::chrono::high_resolution_clock::now();
+    double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(stop - start).count();
+    double gflops = flop / seconds / 1e9;
+
+    printf("%s:\n", name);
+    printf("  Processing: %.6f (s), GFLOPS: %.2f\n", seconds, gflops);
+}
+
+cudaEvent_t start_cuda_timer()
+{
+    cudaEvent_t start;
+    CHK(cudaEventCreate(&start));
+    CHK(cudaEventRecord(start, nullptr));
+    return start;
+}
+
+void end_cuda_timer(cudaEvent_t start, const char* name, double flop)
+{
+    cudaEvent_t stop;
+    CHK(cudaEventCreate(&stop));
+    CHK(cudaEventRecord(stop, nullptr));
+    CHK(cudaEventSynchronize(stop));
+    
+    float millisec;
+    CHK(cudaEventElapsedTime(&millisec, start, stop));
+    double seconds = millisec / 1000.0;
+    double gflops = flop / seconds / 1e9;
+
+    printf("%s:\n", name);
+    printf("  Processing: %.6f (s), GFLOPS: %.2f\n", seconds, gflops);
+    
+    CHK(cudaEventDestroy(start));
+    CHK(cudaEventDestroy(stop));
+}
+
+// Calculate FLOPS based on SAD algorithm:
+// SAD window size^2 * 2 (subtract + add) * pixels * planes * sensors
+double calculateFLOPs(int img_w, int img_h, int ZPlanes, size_t num_sensors)
+{
+    int kernel_size = 2 * RAD + 1;
+    // 2 ops per SAD comparison + geometry overhead
+    return 2.0 * kernel_size * kernel_size * img_w * img_h * ZPlanes * num_sensors;
+}
+
 // Kernel di Warmup per stabilizzare le frequenze della GPU
 __global__ void warmup(float* A, float* B, int w, int h) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -190,245 +242,6 @@ __global__ void planeSweepingSAD_Shared_Pure3D_Kernel(uint8_t* refY, uint8_t* se
 }
 
 
-__global__ void planeSweepingSAD_Shared_3D_Kernel(uint8_t* refY, uint8_t* sensY, float* costCube,
-    int img_w, int img_h, int ZPlanes, float ZNear, float ZFar)
-{
-    extern __shared__ uint8_t tmp[];
-    const int s_width = BLOCKSIZE + 2 * RAD;
-
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    // --- CARICAMENTO SHMEM (Eseguito una sola volta per blocco) ---
-
-    // Caricamento del Centro della Mattonella
-    if (i < img_w && j < img_h)
-        tmp[MI(ty + RAD, tx + RAD, s_width)] = refY[MI(j, i, img_w)];
-    else
-        tmp[MI(ty + RAD, tx + RAD, s_width)] = 0;
-
-    // Caricamento del Lato Sinistro
-    if (tx < RAD) {
-        int gx = i - RAD;
-        int gy = j;
-        tmp[MI(ty + RAD, tx, s_width)] = (gx >= 0 && gy >= 0 && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento del Lato Destro
-    if (tx >= BLOCKSIZE - RAD) {
-        int gx = i + RAD;
-        int gy = j;
-        tmp[MI(ty + RAD, tx + 2 * RAD, s_width)] = (gx < img_w && gy >= 0 && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento del Lato Superiore
-    if (ty < RAD) {
-        int gx = i;
-        int gy = j - RAD;
-        tmp[MI(ty, tx + RAD, s_width)] = (gy >= 0 && gx >= 0 && gx < img_w) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento del Lato Inferiore
-    if (ty >= BLOCKSIZE - RAD) {
-        int gx = i;
-        int gy = j + RAD;
-        tmp[MI(ty + 2 * RAD, tx + RAD, s_width)] = (gy < img_h && gx >= 0 && gx < img_w) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Top-Left
-    if (tx < RAD && ty < RAD) {
-        int gx = i - RAD;
-        int gy = j - RAD;
-        tmp[MI(ty, tx, s_width)] = (gx >= 0 && gy >= 0) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Top-Right
-    if (tx >= BLOCKSIZE - RAD && ty < RAD) {
-        int gx = i + RAD;
-        int gy = j - RAD;
-        tmp[MI(ty, tx + 2 * RAD, s_width)] = (gx < img_w && gy >= 0) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Bottom-Left
-    if (tx < RAD && ty >= BLOCKSIZE - RAD) {
-        int gx = i - RAD;
-        int gy = j + RAD;
-        tmp[MI(ty + 2 * RAD, tx, s_width)] = (gx >= 0 && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Bottom-Right
-    if (tx >= BLOCKSIZE - RAD && ty >= BLOCKSIZE - RAD) {
-        int gx = i + RAD;
-        int gy = j + RAD;
-        tmp[MI(ty + 2 * RAD, tx + 2 * RAD, s_width)] = (gx < img_w && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    __syncthreads();
-
-    // --- LOOP INTERNO SUI PIANI Z ---
-    if (i >= img_w || j >= img_h) return;
-
-    for (int zi = 0; zi < ZPlanes; ++zi) {
-
-        Real z = (Real)ZNear * (Real)ZFar / ((Real)ZNear + (((Real)zi / (Real)ZPlanes) * ((Real)ZFar - (Real)ZNear)));
-
-        Real X_ref = (c_invK[0] * i + c_invK[1] * j + c_invK[2]) * z;
-        Real Y_ref = (c_invK[3] * i + c_invK[4] * j + c_invK[5]) * z;
-        Real Z_ref = (c_invK[6] * i + c_invK[7] * j + c_invK[8]) * z;
-
-        Real Xw = c_R_inv[0] * X_ref + c_R_inv[1] * Y_ref + c_R_inv[2] * Z_ref - c_t_inv[0];
-        Real Yw = c_R_inv[3] * X_ref + c_R_inv[4] * Y_ref + c_R_inv[5] * Z_ref - c_t_inv[1];
-        Real Zw = c_R_inv[6] * X_ref + c_R_inv[7] * Y_ref + c_R_inv[8] * Z_ref - c_t_inv[2];
-
-        Real X_p = c_R_proj[0] * Xw + c_R_proj[1] * Yw + c_R_proj[2] * Zw - c_t_proj[0];
-        Real Y_p = c_R_proj[3] * Xw + c_R_proj[4] * Yw + c_R_proj[5] * Zw - c_t_proj[1];
-        Real Z_p = c_R_proj[6] * Xw + c_R_proj[7] * Yw + c_R_proj[8] * Zw - c_t_proj[2];
-
-        float x_proj = (float)(c_K_proj[0] * X_p / Z_p + c_K_proj[1] * Y_p / Z_p + c_K_proj[2]);
-        float y_proj = (float)(c_K_proj[3] * X_p / Z_p + c_K_proj[4] * Y_p / Z_p + c_K_proj[5]);
-
-        float cost = 0.0f;
-        float count = 0.0f;
-
-        for (int ki = -RAD; ki <= RAD; ++ki) {
-            for (int kj = -RAD; kj <= RAD; ++kj) {
-                uint8_t valRef = tmp[MI(ty + RAD + kj, tx + RAD + ki, s_width)];
-
-                int sx = roundf(x_proj) + ki;
-                int sy = roundf(y_proj) + kj;
-
-                if (sx >= 0 && sx < img_w && sy >= 0 && sy < img_h) {
-                    cost += fabsf((float)valRef - (float)sensY[MI(sy, sx, img_w)]);
-                    count += 1.0f;
-                }
-            }
-        }
-
-        if (count > 0) {
-            int out_idx = zi * (img_w * img_h) + (j * img_w + i);
-            costCube[out_idx] = fminf(cost / count, costCube[out_idx]);
-        }
-    }
-}
-
-
-__global__ void planeSweepingSAD_Naive_3D_Kernel(uint8_t* refY, uint8_t* sensY, float* costCube,
-    int img_w, int img_h, int ZPlanes, float ZNear, float ZFar)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (i >= img_w || j >= img_h) return;
-
-    // Loop interno sui piani Z
-    for (int zi = 0; zi < ZPlanes; ++zi) {
-
-        Real z = (Real)ZNear * (Real)ZFar / ((Real)ZNear + (((Real)zi / (Real)ZPlanes) * ((Real)ZFar - (Real)ZNear)));
-
-        Real X_ref = (c_invK[0] * i + c_invK[1] * j + c_invK[2]) * z;
-        Real Y_ref = (c_invK[3] * i + c_invK[4] * j + c_invK[5]) * z;
-        Real Z_ref = (c_invK[6] * i + c_invK[7] * j + c_invK[8]) * z;
-
-        Real Xw = c_R_inv[0] * X_ref + c_R_inv[1] * Y_ref + c_R_inv[2] * Z_ref - c_t_inv[0];
-        Real Yw = c_R_inv[3] * X_ref + c_R_inv[4] * Y_ref + c_R_inv[5] * Z_ref - c_t_inv[1];
-        Real Zw = c_R_inv[6] * X_ref + c_R_inv[7] * Y_ref + c_R_inv[8] * Z_ref - c_t_inv[2];
-
-        Real X_p = c_R_proj[0] * Xw + c_R_proj[1] * Yw + c_R_proj[2] * Zw - c_t_proj[0];
-        Real Y_p = c_R_proj[3] * Xw + c_R_proj[4] * Yw + c_R_proj[5] * Zw - c_t_proj[1];
-        Real Z_p = c_R_proj[6] * Xw + c_R_proj[7] * Yw + c_R_proj[8] * Zw - c_t_proj[2];
-
-        float x_proj = (float)(c_K_proj[0] * X_p / Z_p + c_K_proj[1] * Y_p / Z_p + c_K_proj[2]);
-        float y_proj = (float)(c_K_proj[3] * X_p / Z_p + c_K_proj[4] * Y_p / Z_p + c_K_proj[5]);
-
-        float cost = 0.0f;
-        float count = 0.0f;
-
-        for (int ki = -RAD; ki <= RAD; ++ki) {
-            for (int kj = -RAD; kj <= RAD; ++kj) {
-                int ref_x = i + ki;
-                int ref_y = j + kj;
-                int sx = roundf(x_proj) + ki;
-                int sy = roundf(y_proj) + kj;
-
-                if (ref_x >= 0 && ref_x < img_w && ref_y >= 0 && ref_y < img_h &&
-                    sx >= 0 && sx < img_w && sy >= 0 && sy < img_h)
-                {
-                    uint8_t valRef = refY[MI(ref_y, ref_x, img_w)];
-                    uint8_t valSens = sensY[MI(sy, sx, img_w)];
-
-                    cost += fabsf((float)valRef - (float)valSens);
-                    count += 1.0f;
-                }
-            }
-        }
-
-        if (count > 0) {
-            int out_idx = zi * (img_w * img_h) + (j * img_w + i);
-            costCube[out_idx] = fminf(cost / count, costCube[out_idx]);
-        }
-    }
-}
-
-// Kernel Na�ve ad alte prestazioni (Polimorfico float/double)
-__global__ void planeSweepingSAD_Naive_Kernel(uint8_t* refY, uint8_t* sensY, float* costCube,
-    int img_w, int img_h, int zi, float ZNear, float ZFar, int ZPlanes)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (i >= img_w || j >= img_h) return;
-
-    Real z = (Real)ZNear * (Real)ZFar / ((Real)ZNear + (((Real)zi / (Real)ZPlanes) * ((Real)ZFar - (Real)ZNear)));
-
-    Real X_ref = (c_invK[0] * i + c_invK[1] * j + c_invK[2]) * z;
-    Real Y_ref = (c_invK[3] * i + c_invK[4] * j + c_invK[5]) * z;
-    Real Z_ref = (c_invK[6] * i + c_invK[7] * j + c_invK[8]) * z;
-
-    Real Xw = c_R_inv[0] * X_ref + c_R_inv[1] * Y_ref + c_R_inv[2] * Z_ref - c_t_inv[0];
-    Real Yw = c_R_inv[3] * X_ref + c_R_inv[4] * Y_ref + c_R_inv[5] * Z_ref - c_t_inv[1];
-    Real Zw = c_R_inv[6] * X_ref + c_R_inv[7] * Y_ref + c_R_inv[8] * Z_ref - c_t_inv[2];
-
-    Real X_p = c_R_proj[0] * Xw + c_R_proj[1] * Yw + c_R_proj[2] * Zw - c_t_proj[0];
-    Real Y_p = c_R_proj[3] * Xw + c_R_proj[4] * Yw + c_R_proj[5] * Zw - c_t_proj[1];
-    Real Z_p = c_R_proj[6] * Xw + c_R_proj[7] * Yw + c_R_proj[8] * Zw - c_t_proj[2];
-
-    float x_proj = (float)(c_K_proj[0] * X_p / Z_p + c_K_proj[1] * Y_p / Z_p + c_K_proj[2]);
-    float y_proj = (float)(c_K_proj[3] * X_p / Z_p + c_K_proj[4] * Y_p / Z_p + c_K_proj[5]);
-
-    float cost = 0.0f;
-    float count = 0.0f;
-
-    for (int ki = -RAD; ki <= RAD; ++ki) {
-        for (int kj = -RAD; kj <= RAD; ++kj) {
-            int ref_x = i + ki;
-            int ref_y = j + kj;
-
-            //int sx = (int)(x_proj + 0.5f) + ki;
-            int sx = roundf(x_proj) + ki;
-            int sy = roundf(y_proj) + kj;
-            //int sy = (int)(y_proj + 0.5f) + kj;
-
-            if (ref_x >= 0 && ref_x < img_w && ref_y >= 0 && ref_y < img_h &&
-                sx >= 0 && sx < img_w && sy >= 0 && sy < img_h)
-            {
-                uint8_t valRef = refY[MI(ref_y, ref_x, img_w)];
-                uint8_t valSens = sensY[MI(sy, sx, img_w)];
-
-                cost += fabsf((float)valRef - (float)valSens);
-                count += 1.0f;
-            }
-        }
-    }
-
-    if (count > 0) {
-        int out_idx = zi * (img_w * img_h) + (j * img_w + i);
-        costCube[out_idx] = fminf(cost / count, costCube[out_idx]);
-    }
-}
-
 __global__ void planeSweepingSAD_Naive_Pure3D_Kernel(uint8_t* refY, uint8_t* sensY, float* costCube,
     int img_w, int img_h, float ZNear, float ZFar, int ZPlanes)
 {
@@ -489,126 +302,6 @@ __global__ void planeSweepingSAD_Naive_Pure3D_Kernel(uint8_t* refY, uint8_t* sen
     }
 }
 
-// Kernel Shared Memory ottimizzato (Polimorfico float/double)
-__global__ void planeSweepingSAD_Kernel(uint8_t* refY, uint8_t* sensY, float* costCube,
-    int img_w, int img_h, int zi, float ZNear, float ZFar, int ZPlanes)
-{
-    extern __shared__ uint8_t tmp[];
-    const int s_width = BLOCKSIZE + 2 * RAD;
-
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    // Caricamento del Centro della Mattonella
-    if (i < img_w && j < img_h)
-        tmp[MI(ty + RAD, tx + RAD, s_width)] = refY[MI(j, i, img_w)];
-    else
-        tmp[MI(ty + RAD, tx + RAD, s_width)] = 0;
-
-    // Caricamento del Lato Sinistro
-    if (tx < RAD) {
-        int gx = i - RAD;
-        int gy = j;
-        tmp[MI(ty + RAD, tx, s_width)] = (gx >= 0 && gy >= 0 && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento del Lato Destro
-    if (tx >= BLOCKSIZE - RAD) {
-        int gx = i + RAD;
-        int gy = j;
-        tmp[MI(ty + RAD, tx + 2 * RAD, s_width)] = (gx < img_w && gy >= 0 && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento del Lato Superiore
-    if (ty < RAD) {
-        int gx = i;
-        int gy = j - RAD;
-        tmp[MI(ty, tx + RAD, s_width)] = (gy >= 0 && gx >= 0 && gx < img_w) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento del Lato Inferiore
-    if (ty >= BLOCKSIZE - RAD) {
-        int gx = i;
-        int gy = j + RAD;
-        tmp[MI(ty + 2 * RAD, tx + RAD, s_width)] = (gy < img_h && gx >= 0 && gx < img_w) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Top-Left
-    if (tx < RAD && ty < RAD) {
-        int gx = i - RAD;
-        int gy = j - RAD;
-        tmp[MI(ty, tx, s_width)] = (gx >= 0 && gy >= 0) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Top-Right
-    if (tx >= BLOCKSIZE - RAD && ty < RAD) {
-        int gx = i + RAD;
-        int gy = j - RAD;
-        tmp[MI(ty, tx + 2 * RAD, s_width)] = (gx < img_w && gy >= 0) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Bottom-Left
-    if (tx < RAD && ty >= BLOCKSIZE - RAD) {
-        int gx = i - RAD;
-        int gy = j + RAD;
-        tmp[MI(ty + 2 * RAD, tx, s_width)] = (gx >= 0 && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    // Caricamento dell'Angolo Bottom-Right
-    if (tx >= BLOCKSIZE - RAD && ty >= BLOCKSIZE - RAD) {
-        int gx = i + RAD;
-        int gy = j + RAD;
-        tmp[MI(ty + 2 * RAD, tx + 2 * RAD, s_width)] = (gx < img_w && gy < img_h) ? refY[MI(gy, gx, img_w)] : 0;
-    }
-
-    __syncthreads();
-
-    if (i >= img_w || j >= img_h) return;
-
-    Real z = (Real)ZNear * (Real)ZFar / ((Real)ZNear + (((Real)zi / (Real)ZPlanes) * ((Real)ZFar - (Real)ZNear)));
-
-    Real X_ref = (c_invK[0] * i + c_invK[1] * j + c_invK[2]) * z;
-    Real Y_ref = (c_invK[3] * i + c_invK[4] * j + c_invK[5]) * z;
-    Real Z_ref = (c_invK[6] * i + c_invK[7] * j + c_invK[8]) * z;
-
-    Real Xw = c_R_inv[0] * X_ref + c_R_inv[1] * Y_ref + c_R_inv[2] * Z_ref - c_t_inv[0];
-    Real Yw = c_R_inv[3] * X_ref + c_R_inv[4] * Y_ref + c_R_inv[5] * Z_ref - c_t_inv[1];
-    Real Zw = c_R_inv[6] * X_ref + c_R_inv[7] * Y_ref + c_R_inv[8] * Z_ref - c_t_inv[2];
-
-    Real X_p = c_R_proj[0] * Xw + c_R_proj[1] * Yw + c_R_proj[2] * Zw - c_t_proj[0];
-    Real Y_p = c_R_proj[3] * Xw + c_R_proj[4] * Yw + c_R_proj[5] * Zw - c_t_proj[1];
-    Real Z_p = c_R_proj[6] * Xw + c_R_proj[7] * Yw + c_R_proj[8] * Zw - c_t_proj[2];
-
-    float x_proj = (float)(c_K_proj[0] * X_p / Z_p + c_K_proj[1] * Y_p / Z_p + c_K_proj[2]);
-    float y_proj = (float)(c_K_proj[3] * X_p / Z_p + c_K_proj[4] * Y_p / Z_p + c_K_proj[5]);
-
-    float cost = 0.0f;
-    float count = 0.0f;
-
-    for (int ki = -RAD; ki <= RAD; ++ki) {
-        for (int kj = -RAD; kj <= RAD; ++kj) {
-            uint8_t valRef = tmp[MI(ty + RAD + kj, tx + RAD + ki, s_width)];
-
-            //int sx = (int)(x_proj + 0.5f) + ki;
-            int sx = roundf(x_proj) + ki;
-            int sy = roundf(y_proj) + kj;
-            //int sy = (int)(y_proj + 0.5f) + kj;
-
-            if (sx >= 0 && sx < img_w && sy >= 0 && sy < img_h) {
-                cost += fabsf((float)valRef - (float)sensY[MI(sy, sx, img_w)]);
-                count += 1.0f;
-            }
-        }
-    }
-
-    if (count > 0) {
-        int out_idx = zi * (img_w * img_h) + (j * img_w + i);
-        costCube[out_idx] = fminf(cost / count, costCube[out_idx]);
-    }
-}
 
 __global__ void initCostCube(float* cube, int size, float val) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -621,6 +314,9 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
     const std::vector<std::vector<double>>& cam_params,
     float* cost_cube, float ZNear, float ZFar, int ZPlanes)
 {
+
+    auto total_start = start_cpu_timer();
+    double flops = calculateFLOPs(width, height, ZPlanes, sensor_images.size());
     const int imgSize = width * height;
     size_t plane = width * height * sizeof(float);
 
@@ -633,7 +329,6 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
     //warmup << <warmupgrid, warmupblock >> > (warmupA, warmupB, width, height);
     //CHK(cudaGetLastError());
 
-    auto total_start = std::chrono::high_resolution_clock::now();
 
     uint8_t* d_ref, * d_sens;
     float* d_costCube;
@@ -666,8 +361,7 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
     // (Puoi commentare o eliminare sharedMemBytes, non serve per il Naïve)
      size_t sharedMemBytes = (BLOCKSIZE + 2 * RAD) * (BLOCKSIZE + 2 * RAD) * sizeof(uint8_t);
 
-    auto kernel_start = std::chrono::high_resolution_clock::now();
-
+    auto kernel_start = start_cuda_timer();
     for (size_t c = 0; c < sensor_images.size(); c++) {
         const auto& sens_params = cam_params[c + 1];
 
@@ -688,17 +382,10 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
         CHK(cudaGetLastError());
     }
 
-    auto kernel_end = std::chrono::high_resolution_clock::now();
-    auto total_end = std::chrono::high_resolution_clock::now();
-
-    double kernel_ms = std::chrono::duration<double>(kernel_end - kernel_start).count();
-
-    double total_ms = std::chrono::duration<double>(total_end - total_start).count();
-
-    printf("Kernel time: %.3f s\n", kernel_ms);
-    printf("Total time: %.3f s \n", total_ms);
 
     CHK(cudaDeviceSynchronize());
+    end_cuda_timer(kernel_start, "CONSTANT_MEMORY (Kernel)", flops);
+    end_cpu_timer(total_start, "CONSTANT_MEMORY (Total)", flops);
 
     CHK(cudaMemcpy(cost_cube, d_costCube, imgSize * ZPlanes * sizeof(float), cudaMemcpyDeviceToHost));
 
