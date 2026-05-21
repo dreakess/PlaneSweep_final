@@ -419,15 +419,25 @@ void copySensorImageToDevice(uint8_t* d_sens, const uint8_t* sensor_image, int i
 
 // ====== Device Memory Camera Parameters Functions ======
 
-void allocateCameraParamsDeviceMemory(Real*& d_invK, Real*& d_R_inv, Real*& d_t_inv,
-                                       Real*& d_K_proj, Real*& d_R_proj, Real*& d_t_proj)
+void allocateCameraParamsDeviceMemory(Real*& h_ptr_invK, Real*& h_ptr_R_inv, Real*& h_ptr_t_inv,
+                                       Real*& h_ptr_K_proj, Real*& h_ptr_R_proj, Real*& h_ptr_t_proj)
 {
-    CHK(cudaMalloc(&d_invK, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&d_R_inv, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&d_t_inv, 3 * sizeof(Real)));
-    CHK(cudaMalloc(&d_K_proj, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&d_R_proj, 9 * sizeof(Real)));
-    CHK(cudaMalloc(&d_t_proj, 3 * sizeof(Real)));
+    // 1. Alloca la memoria (h_ptr_... contengono ora gli indirizzi VRAM validi)
+    CHK(cudaMalloc(&h_ptr_invK, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&h_ptr_R_inv, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&h_ptr_t_inv, 3 * sizeof(Real)));
+    CHK(cudaMalloc(&h_ptr_K_proj, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&h_ptr_R_proj, 9 * sizeof(Real)));
+    CHK(cudaMalloc(&h_ptr_t_proj, 3 * sizeof(Real)));
+
+    // 2. IL PONTE: Copia questi indirizzi dentro i puntatori globali __device__ della GPU
+    // Nota: d_invK è il nome della variabile __device__ in cima al tuo file
+    CHK(cudaMemcpyToSymbol(d_invK, &h_ptr_invK, sizeof(Real*)));
+    CHK(cudaMemcpyToSymbol(d_R_inv, &h_ptr_R_inv, sizeof(Real*)));
+    CHK(cudaMemcpyToSymbol(d_t_inv, &h_ptr_t_inv, sizeof(Real*)));
+    CHK(cudaMemcpyToSymbol(d_K_proj, &h_ptr_K_proj, sizeof(Real*)));
+    CHK(cudaMemcpyToSymbol(d_R_proj, &h_ptr_R_proj, sizeof(Real*)));
+    CHK(cudaMemcpyToSymbol(d_t_proj, &h_ptr_t_proj, sizeof(Real*)));
 }
 
 void deallocateCameraParamsDeviceMemory(Real* d_invK, Real* d_R_inv, Real* d_t_inv,
