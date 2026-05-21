@@ -51,20 +51,6 @@ __constant__ Real c_t_proj[3];
 //__device__ Real c_t_proj[3];
 
 
-std::chrono::high_resolution_clock::time_point start_cpu_timer()
-{
-    return std::chrono::high_resolution_clock::now();
-}
-
-void end_cpu_timer(std::chrono::high_resolution_clock::time_point start, const char* name, double flop)
-{
-    auto stop = std::chrono::high_resolution_clock::now();
-    double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(stop - start).count();
-    double gflops = flop / seconds / 1e9;
-
-    printf("%s:\n", name);
-    printf("  Processing: %.6f (s), GFLOPS: %.2f\n", seconds, gflops);
-}
 
 cudaEvent_t start_cuda_timer()
 {
@@ -80,7 +66,7 @@ void end_cuda_timer(cudaEvent_t start, const char* name, double flop)
     CHK(cudaEventCreate(&stop));
     CHK(cudaEventRecord(stop, nullptr));
     CHK(cudaEventSynchronize(stop));
-    
+
     float millisec;
     CHK(cudaEventElapsedTime(&millisec, start, stop));
     double seconds = millisec / 1000.0;
@@ -88,7 +74,7 @@ void end_cuda_timer(cudaEvent_t start, const char* name, double flop)
 
     printf("%s:\n", name);
     printf("  Processing: %.6f (s), GFLOPS: %.2f\n", seconds, gflops);
-    
+
     CHK(cudaEventDestroy(start));
     CHK(cudaEventDestroy(stop));
 }
@@ -117,7 +103,7 @@ __global__ void planeSweepingSAD_Shared_Pure3D_Kernel(uint8_t* refY, uint8_t* se
     int img_w, int img_h, float ZNear, float ZFar, int ZPlanes)
 {
     extern __shared__ uint8_t tmp[];
-    const int s_width = BLOCKSIZE + 2 * RAD;
+    const int s_width = BLOCKSIZE + 2 * RAD +1;
 
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -315,7 +301,7 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
     float* cost_cube, float ZNear, float ZFar, int ZPlanes)
 {
 
-    auto total_start = start_cpu_timer();
+ 
     double flops = calculateFLOPs(width, height, ZPlanes, sensor_images.size());
     const int imgSize = width * height;
     size_t plane = width * height * sizeof(float);
@@ -359,7 +345,7 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
     dim3 grid_3D((width + BLOCKSIZE - 1) / BLOCKSIZE, (height + BLOCKSIZE - 1) / BLOCKSIZE, ZPlanes);
 
     // (Puoi commentare o eliminare sharedMemBytes, non serve per il Naïve)
-     size_t sharedMemBytes = (BLOCKSIZE + 2 * RAD) * (BLOCKSIZE + 2 * RAD) * sizeof(uint8_t);
+    size_t sharedMemBytes = (BLOCKSIZE + 2 * RAD) * (BLOCKSIZE + 2 * RAD) * sizeof(uint8_t);
 
     auto kernel_start = start_cuda_timer();
     for (size_t c = 0; c < sensor_images.size(); c++) {
@@ -376,7 +362,9 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
         CHK(cudaMemcpy(d_sens, sensor_images[c], imgSize, cudaMemcpyHostToDevice));
 
         // 2. LANCIO DEL KERNEL: Usiamo grid_3D e togliamo sharedMemBytes
-        planeSweepingSAD_Naive_Pure3D_Kernel << <grid_3D, block, sharedMemBytes >> > (
+        //planeSweepingSAD_Naive_Pure3D_Kernel << <grid_3D, block >> > (
+        //    d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
+        planeSweepingSAD_Shared_Pure3D_Kernel << <grid_3D, block,sharedMemBytes >> > (
             d_ref, d_sens, d_costCube, width, height, ZNear, ZFar, ZPlanes);
 
         CHK(cudaGetLastError());
@@ -385,7 +373,7 @@ void runPlaneSweepingGPU(const uint8_t* ref_image, int width, int height,
 
     CHK(cudaDeviceSynchronize());
     end_cuda_timer(kernel_start, "CONSTANT_MEMORY (Kernel)", flops);
-    end_cpu_timer(total_start, "CONSTANT_MEMORY (Total)", flops);
+
 
     CHK(cudaMemcpy(cost_cube, d_costCube, imgSize * ZPlanes * sizeof(float), cudaMemcpyDeviceToHost));
 
