@@ -240,36 +240,4 @@ The warmup is commented out in the code. To re-enable it (useful for more accura
 
 ---
 
-## Output and Performance Metrics
 
-At the end of execution, `end_cuda_timer` prints:
-
-```
-CONSTANT_MEMORY (Kernel):
-  Processing: 0.023141 (s), GFLOPS: 12.47
-```
-
-The FLOP count is estimated as:
-```
-FLOP = 2 * (2*RAD+1)^2 * img_w * img_h * ZPlanes * num_sensors
-```
-
-The factor of 2 approximates the subtraction and accumulation operations per SAD pixel. The geometric pipeline cost is not included, so this should be treated as a lower bound.
-
-The resulting **cost cube** has dimensions `[ZPlanes × img_h × img_w]` in float. To extract the depth map, select for each pixel `(i, j)` the plane `zi` with the minimum cost and convert it to depth using the inverse formula.
-
----
-
-## Requirements
-
-- CUDA Toolkit ≥ 11.0
-- GPU with Compute Capability ≥ 6.0 (Pascal or newer)
-- C++14-compatible compiler (`nvcc`)
-
-Example compilation:
-
-```bash
-nvcc -O3 -arch=sm_86 planeSweeping.cu -o planeSweeping
-```
-
-Replace `sm_86` with your GPU's architecture (`sm_75` for Turing, `sm_80` for Ampere A100, etc.).
